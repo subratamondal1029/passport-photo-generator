@@ -1,71 +1,73 @@
-"""Background segmentation and removal module using MediaPipe SelfieSegmenter."""
+"""Background segmentation and removal module using rembg."""
 
 from __future__ import annotations
 
-from pathlib import Path
+from typing import Any
 import cv2
-import mediapipe as mp
 import numpy as np
-from mediapipe.tasks import python
-from mediapipe.tasks.python import vision
+from rembg import new_session, remove
+
+DEFAULT_MODEL_NAME = "u2net_human_seg"
+_GLOBAL_SESSION: Any = None
 
 
-def _create_segmenter(model_path: str | Path) -> vision.ImageSegmenter:
-    """Create a MediaPipe ImageSegmenter instance using selfie_segmenter.tflite."""
-    path = Path(model_path)
-    if not path.is_file():
-        raise FileNotFoundError(f"Segmenter model not found at: {path.resolve()}")
-
-    base_options = python.BaseOptions(model_asset_path=str(path))
-    options = vision.ImageSegmenterOptions(
-        base_options=base_options,
-        running_mode=vision.RunningMode.IMAGE,
-        output_confidence_masks=True,
-    )
-    return vision.ImageSegmenter.create_from_options(options)
+def get_rembg_session(model_name: str = DEFAULT_MODEL_NAME) -> Any:
+    """Retrieve or initialize a cached rembg ONNX session."""
+    global _GLOBAL_SESSION
+    if _GLOBAL_SESSION is None or getattr(_GLOBAL_SESSION, "model_name", None) != model_name:
+        _GLOBAL_SESSION = new_session(model_name)
+    return _GLOBAL_SESSION
 
 
 def remove_background(
     bgr_image: np.ndarray,
-    model_path: str | Path = "models/selfie_segmenter.tflite",
-    threshold: float = 0.5,
-    feather_edges: bool = True,
+    model_name: str = DEFAULT_MODEL_NAME,
+    alpha_matting: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Segment person from background and generate transparent cutout and alpha mask.
+    """Segment person from background using rembg and generate high-fidelity cutout.
 
     Args:
         bgr_image: Input image as OpenCV BGR ndarray (H, W, 3).
-        model_path: Path to selfie_segmenter.tflite model file.
-        threshold: Confidence threshold for subject segmentation (0.0 to 1.0).
-        feather_edges: Whether to gently blur mask borders to avoid jagged edges.
+        model_name: Rembg model name. Defaults to 'u2net_human_seg'.
+        alpha_matting: Enable alpha matting for enhanced hair and edge precision.
 
     Returns:
         tuple[np.ndarray, np.ndarray]:
-            - bgra_image: Cutout with alpha channel (H, W, 4), uint8.
+            - bgra_image: Subject cutout with alpha channel (H, W, 4), uint8.
             - alpha_mask: Continuous alpha mask (H, W), float32 in range [0.0, 1.0].
+
+    Raises:
+        RuntimeError: If background removal fails.
     """
-    rgb_image = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB)
-    mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_image)
+    if bgr_image.ndim != 3 or bgr_image.shape[2] != 3:
+        raise ValueError(f"Expected BGR 3-channel image, got shape: {bgr_image.shape}")
 
-    with _create_segmenter(model_path) as segmenter:
-        result = segmenter.segment(mp_img)
+    try:
+        session = get_rembg_session(model_name)
 
-    raw_mask = result.confidence_masks[0].numpy_view()
-    if raw_mask.ndim == 3:
-        raw_mask = raw_mask[:, :, 0]
+        # rembg expects RGB input
+        rgb_image = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB)
 
-    # Normalize mask values based on threshold
-    # Soft sigmoid-style edge ramp around threshold
-    if feather_edges:
-        # Slight Gaussian blur to soften harsh pixelation around hair
-        smoothed = cv2.GaussianBlur(raw_mask, (5, 5), sigmaX=1.0)
-        alpha_mask = np.clip((smoothed - (threshold - 0.15)) / 0.3, 0.0, 1.0).astype(np.float32)
-    else:
-        alpha_mask = (raw_mask >= threshold).astype(np.float32)
+        # Run rembg
+        rgba_output = remove(
+            rgb_image,
+            session=session,
+            alpha_matting=alpha_matting,
+            alpha_matting_foreground_threshold=240,
+            alpha_matting_background_threshold=10,
+            alpha_matting_erode_size=10,
+        )
 
-    # Build BGRA cutout
-    alpha_uint8 = (alpha_mask * 255.0).astype(np.uint8)
-    bgra_image = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2BGRA)
-    bgra_image[:, :, 3] = alpha_uint8
+        if not isinstance(rgba_output, np.ndarray):
+            rgba_output = np.array(rgba_output)
 
-    return bgra_image, alpha_mask
+        # Convert RGBA to BGRA for OpenCV consistency
+        bgra_image = cv2.cvtColor(rgba_output, cv2.COLOR_RGBA2BGRA)
+
+        # Extract normalized float32 alpha mask [0.0, 1.0]
+        alpha_channel = bgra_image[:, :, 3].astype(np.float32) / 255.0
+
+        return bgra_image, alpha_channel
+
+    except Exception as err:
+        raise RuntimeError(f"Background removal failed using model '{model_name}': {err}") from err
