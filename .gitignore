@@ -9,5 +9,8 @@ wheels/
 # downloaded models
 models/
 
+# testing data
+data/
+
 # Virtual environments
 .venv
